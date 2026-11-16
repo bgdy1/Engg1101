@@ -1,0 +1,10 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.tmp
+.env
+.env.*
+**/config/robot.json
+.DS_Store
+Thumbs.db
