@@ -4,7 +4,7 @@ from pathlib import Path
 import runpy
 import tempfile
 import unittest
-from unittest.mock import MagicMock, Mock, call, patch
+from unittest.mock import Mock, call, patch
 
 import arm_settings as settings
 
@@ -26,8 +26,6 @@ class WaypointRecordingTests(unittest.TestCase):
         self.stack.enter_context(redirect_stderr(self.output))
         self.port = Mock()
         self.handler = object()
-        self.terminal = MagicMock()
-        self.terminal.__enter__.return_value = self.terminal
         self.events = []
         self.disable = Mock(side_effect=lambda _handler: self.events.append("disable"))
         self.read = Mock()
@@ -36,19 +34,26 @@ class WaypointRecordingTests(unittest.TestCase):
             "connect": Mock(return_value=(self.port, self.handler)),
             "disable_all_torque": self.disable,
             "read_all": self.read,
-            "RawTerminal": Mock(return_value=self.terminal),
         }))
         self.pose1 = dict(zip(settings.JOINT_NAMES, (2049, 2162, 1934, 2276, 1024)))
         self.pose2 = dict(zip(settings.JOINT_NAMES, (2051, 2050, 2047, 2052, 1707)))
 
-    def record(self, keys, poses=None, names=None):
-        self.terminal.read_key.side_effect = keys
+    def record(self, commands, poses=None, names=None, action_names=None):
         self.read.side_effect = poses if poses is not None else [self.pose1, self.pose2]
         answers = iter([""] + (names if names is not None else ["demo"]))
+        commands = iter(commands)
+        action_names = iter(action_names) if action_names is not None else None
 
-        def answer(_prompt):
-            value = next(answers)
+        def answer(prompt):
             self.events.append("input")
+            if prompt.startswith("Command"):
+                value = next(commands)
+            elif prompt.startswith("Action name"):
+                value = next(action_names) if action_names is not None else ""
+            else:
+                value = next(answers)
+            if isinstance(value, BaseException):
+                raise value
             return value
 
         with patch("builtins.input", side_effect=answer):
@@ -56,7 +61,6 @@ class WaypointRecordingTests(unittest.TestCase):
 
     def assert_closed(self):
         self.port.closePort.assert_called_once_with()
-        self.terminal.__exit__.assert_called_once()
 
     def test_recorded_angles_round_trip_through_05_without_precision_loss(self):
         path = self.record(["q", "q", "e"])
@@ -70,17 +74,17 @@ class WaypointRecordingTests(unittest.TestCase):
             {"servo_id": settings.SERVO_IDS[name], "joint": name}
             for name in settings.JOINT_NAMES
         ])
-        self.assertEqual(set(metadata["points"][0]), {"input_values"})
+        self.assertEqual(set(metadata["points"][0]), {"input_values", "action_name"})
         values = metadata["points"][0]["input_values"]
         self.assertTrue(all(isinstance(value, str) for value in values))
         self.assertEqual(float(values[0]), 360 / 4096)
         self.assertEqual(float(values[4]), 90.0)  # Reversed gripper direction.
-        self.assertEqual(self.events, ["input", "disable", "input"])
+        self.assertEqual(self.events[:3], ["input", "disable", "input"])
         self.assertEqual(self.read.call_args_list, [call(self.handler), call(self.handler)])
         self.assert_closed()
 
-    def test_e_before_two_points_keeps_recording_and_other_keys_do_not_read(self):
-        self.record(["e", "x", "\r", None, "q", "e", "q", "e"])
+    def test_e_before_two_points_keeps_recording_and_other_commands_do_not_read(self):
+        self.record(["e", "x", "", "q", "e", "q", "e"])
         self.assertEqual(self.read.call_count, 2)
         self.assertEqual(self.output.getvalue().count("Record at least two"), 2)
         self.assertTrue((self.folder / "demo.json").exists())
@@ -98,8 +102,8 @@ class WaypointRecordingTests(unittest.TestCase):
         self.assertIn("shoulder", self.output.getvalue())
         self.assertEqual(player["load_sequence"](path)[1], [self.pose1, self.pose2])
 
-    def test_raw_ctrl_c_saves_completed_points_and_restores_terminal(self):
-        path = self.record(["q", "q", "\x03"])
+    def test_eof_saves_completed_points(self):
+        path = self.record(["q", "q", EOFError()])
         self.assertEqual(player["load_sequence"](path)[1], [self.pose1, self.pose2])
         self.assert_closed()
 
@@ -109,9 +113,9 @@ class WaypointRecordingTests(unittest.TestCase):
         self.assert_closed()
 
     def test_interruption_with_fewer_than_two_points_does_not_save(self):
-        for keys in (["\x03"], ["q", "\x03"]):
-            with self.subTest(keys=keys):
-                self.assertIsNone(self.record(keys))
+        for commands in ([KeyboardInterrupt()], ["q", EOFError()]):
+            with self.subTest(commands=commands):
+                self.assertIsNone(self.record(commands))
                 self.assertEqual(list(self.folder.iterdir()), [])
 
     def test_read_failure_saves_only_previously_completed_points(self):
@@ -135,9 +139,9 @@ class WaypointRecordingTests(unittest.TestCase):
             from arm_helpers import read_all
             with patch.dict(recording["read_angle_point"].__globals__, {"read_all": read_all}):
                 points = []
-                self.terminal.read_key.side_effect = ["q"]
-                with self.assertRaisesRegex(RuntimeError, "axis 4"):
-                    recording["record_points"](self.handler, points)
+                with patch("builtins.input", return_value="q"):
+                    with self.assertRaisesRegex(RuntimeError, "axis 4"):
+                        recording["record_points"](self.handler, points)
                 self.assertEqual(points, [])
 
     def test_torque_failure_prevents_naming_and_closes_port(self):
@@ -172,26 +176,57 @@ class WaypointRecordingTests(unittest.TestCase):
         self.assertIn("disk failure", self.output.getvalue())
         self.assertNotIn("Saved", self.output.getvalue())
 
-    def test_real_terminal_context_restores_settings_after_communication_error(self):
-        from terminal_keys import RawTerminal
+    def test_import_has_no_raw_terminal_dependency(self):
+        with patch.dict("sys.modules", {"terminal_keys": None}):
+            module = runpy.run_path("scripts/06_waypoint_recording.py", run_name="no_raw_terminal")
+        self.assertNotIn("RawTerminal", module)
 
-        terminal_settings = ["saved settings"]
-        self.read.side_effect = RuntimeError("serial failure")
-        with ExitStack() as stack:
-            stack.enter_context(patch.dict(recording["record_points"].__globals__, {
-                "RawTerminal": RawTerminal,
-            }))
-            stack.enter_context(patch("terminal_keys.sys.stdin.isatty", return_value=True))
-            stack.enter_context(patch("terminal_keys.sys.stdin.fileno", return_value=7))
-            stack.enter_context(patch("terminal_keys.termios.tcgetattr", return_value=terminal_settings))
-            setraw = stack.enter_context(patch("terminal_keys.tty.setraw"))
-            restore = stack.enter_context(patch("terminal_keys.termios.tcsetattr"))
-            stack.enter_context(patch.object(RawTerminal, "read_key", return_value="q"))
-            with self.assertRaisesRegex(RuntimeError, "serial failure"):
-                recording["record_points"](self.handler, [])
-        setraw.assert_called_once_with(7)
-        self.assertEqual(restore.call_args.args[0], 7)
-        self.assertIs(restore.call_args.args[2], terminal_settings)
+    def test_chinese_and_empty_names_are_saved_as_editable_json(self):
+        path = self.record(["q", "q", "e"], action_names=["  夹住物体  ", "   "])
+        metadata, _points = player["load_sequence"](path)
+        self.assertEqual([point["action_name"] for point in metadata["points"]], ["夹住物体", ""])
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("夹住物体", text)
+        self.assertIn("步骤 2", self.output.getvalue())
+
+    def test_repeated_poses_are_sampled_again_and_kept_as_independent_points(self):
+        path = self.record([" Q ", " q ", " E "], poses=[self.pose1, self.pose1])
+        metadata, points = player["load_sequence"](path)
+        self.assertEqual(points, [self.pose1, self.pose1])
+        self.assertEqual(len(metadata["points"]), 2)
+        self.assertEqual(self.read.call_count, 2)
+
+    def test_names_q_and_e_are_text_and_sampling_precedes_the_name_prompt(self):
+        answers = iter(["q", "q", "q", "e", "e"])
+        self.read.side_effect = [self.pose1, self.pose2]
+
+        def answer(prompt):
+            if prompt.startswith("Action name"):
+                self.assertEqual(self.read.call_count, len(points) + 1)
+            return next(answers)
+
+        points = []
+        with patch("builtins.input", side_effect=answer):
+            recording["record_points"](self.handler, points)
+        self.assertEqual([point["action_name"] for point in points], ["q", "e"])
+        self.assertEqual(self.read.call_count, 2)
+
+    def test_interrupted_name_discards_only_the_unconfirmed_point(self):
+        for interruption in (KeyboardInterrupt(), EOFError()):
+            with self.subTest(interruption=type(interruption).__name__):
+                with patch("builtins.input", side_effect=["q", "", "q", interruption]):
+                    self.read.side_effect = [self.pose1, self.pose2]
+                    points = []
+                    with self.assertRaises(type(interruption)):
+                        recording["record_points"](self.handler, points)
+                self.assertEqual(len(points), 1)
+                self.assertEqual(points[0]["action_name"], "")
+
+    def test_interrupt_during_naming_saves_previous_complete_points(self):
+        path = self.record(["q", "q", "q"], poses=[self.pose1, self.pose2, self.pose1],
+                           action_names=["first", "", KeyboardInterrupt()])
+        self.assertEqual(player["load_sequence"](path)[1], [self.pose1, self.pose2])
+        self.assert_closed()
 
     def test_save_refuses_a_file_created_during_recording(self):
         path = self.folder / "demo.json"

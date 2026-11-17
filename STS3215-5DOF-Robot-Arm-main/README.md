@@ -127,6 +127,12 @@ immediately, or `q` to save without playing. Choose **2** to play a saved
 sequence. Files are stored in `motions/`; angle inputs use the current calibration
 when played.
 
+Before sending each waypoint, playback prints its step number, optional
+`action_name`, and all five target joint angles in degrees. Missing or blank
+names appear as “步骤 N”. The angles describe the actual raw targets converted
+using the current calibration, rounded to two decimal places; these are not
+live position readings. Each step remains visible in the terminal history.
+
 ```sh
 python scripts/05_waypoint_sequence.py
 ```
@@ -144,8 +150,9 @@ python scripts/06_waypoint_recording.py
 
 1. Support the arm and press Enter. The script connects and releases torque on all five servos.
 2. Enter a new filename without `.json`: 1-48 characters, starting with a letter or number, followed by letters, numbers, `_` or `-`. Invalid or existing names are requested again.
-3. Move the arm by hand, hold it steady, and press **q** to record one complete five-joint pose. No Enter is needed. Each captured point displays its joint angles in degrees. Poses outside the configured angle limits are rejected; adjust the pose and press q again.
-4. Press **e** to save and exit. At least two points are required; otherwise recording continues.
+3. Move the arm by hand, hold it steady, and type **q + Enter** to capture one complete five-joint pose. The angles are sampled when Enter is pressed. Poses outside the configured angle limits are rejected; adjust the pose and enter q again.
+4. Enter an action name and press Enter, or leave it blank and press Enter to skip naming. The point is then added and its name and five angles are displayed. During naming, q/e are ordinary text.
+5. Type **e + Enter** to save and exit. At least two points are required; otherwise recording continues. Commands accept either case and ignore surrounding whitespace.
 
 Files are saved to this repository's `motions/<name>.json`, regardless of the
 working directory. They use `type: "pose_sequence"` and `input_type: "angles"`;
@@ -153,13 +160,30 @@ the saved values are calibrated joint angles in degrees, with full conversion
 precision, rather than raw ticks. To play them, run **05** and choose **2**.
 Playback uses the calibration currently in `arm_settings.py`.
 
-Ctrl+C or a communication failure ends recording and attempts to save previously
-completed points if there are at least two. Failed reads never add partial points.
-Save failures are reported, and existing files are not overwritten. The terminal
-is restored and the serial port is closed on exit; torque remains released and
+Each point also has an `action_name` field you can edit as its description:
+
+```json
+{"input_values": ["0", "10", "-10", "20", "30"], "action_name": "夹住物体"}
+```
+
+This is standard JSON, so use the field rather than adding `//` comments.
+Chinese names are saved directly as UTF-8. Names are optional; missing, empty,
+or whitespace-only names display as “步骤 N” in 05. If present, the field must
+be a string. Existing files need no changes. Every q + Enter reads a new pose;
+identical poses are kept as separate waypoints and played in order. Repeating
+a waypoint does not create a fixed-duration dwell.
+
+Ctrl+C, EOF, or a communication failure ends recording and attempts to save
+previously completed points if there are at least two. A point is complete after
+its name input is confirmed, including a blank Enter. Interrupting that prompt
+discards the unconfirmed point. Failed reads never add partial points.
+Save failures are reported, and existing files are not overwritten. The serial
+port is closed on exit; torque remains released and
 the script does not play the recording. Keep supporting the arm throughout.
-Five joints are read sequentially, so hold each pose still when pressing q.
-Native Windows terminal control is not supported.
+Five joints are read sequentially, so hold each pose still when entering q.
+06 uses ordinary line input and no longer imports the POSIX terminal module;
+05 and the other movement/playback scripts still require a POSIX terminal.
+Native Windows hardware operation has not been verified.
 
 ## 4. Explore the 3D simulation
 
@@ -212,7 +236,7 @@ because only one program should use the serial port at a time.
 | --- | --- |
 | `arm_settings.py` | Serial connection, calibration, limits and motion speeds. |
 | `arm_helpers.py` | Shared motor communication and raw-position/angle conversion. |
-| `terminal_keys.py` | Reads single keys during movement/playback and waypoint recording. |
+| `terminal_keys.py` | Reads single keys during movement/playback; 06 uses ordinary line input. |
 | `scservo_sdk/` | Vendor library for communicating with the servos. |
 | `motions/` | Saved recordings and waypoint sequences. |
 | `tests/` | Offline checks using mocked motor communication. |

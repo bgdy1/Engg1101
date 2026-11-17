@@ -19,6 +19,7 @@ from arm_helpers import (
     disable_all_torque,
     enable_all_torque,
     move_all_sync,
+    positions_to_angles,
     wait_for_servos_or_estop,
 )
 from terminal_keys import RawTerminal
@@ -184,6 +185,8 @@ def load_sequence(path):
     for index, point in enumerate(points, start=1):
         if not isinstance(point, dict):
             raise ValueError(f"{path.name}: point {index} must be an object")
+        if not isinstance(point.get("action_name", ""), str):
+            raise ValueError(f"{path.name}: point {index}: action_name must be a string")
         input_values = point.get("input_values")
         if input_values is not None:
             try:
@@ -231,6 +234,16 @@ def find_sequences():
     return sequences
 
 
+def format_point_status(index, total, point, positions):
+    """Describe the action and calibrated angles of the targets being sent."""
+    action_name = point.get("action_name", "").strip() or f"步骤 {index}"
+    angles = positions_to_angles(positions)
+    lines = [f"正在执行 {index}/{total}: {action_name} (Space = E-stop)"]
+    lines.append("Target joint angles (degrees):")
+    lines.extend(f"  {name}: {angles[name]:.2f} deg" for name in settings.JOINT_NAMES)
+    return "\n".join(lines)
+
+
 def play_sequence(path):
     sequence, points = load_sequence(path)
     print(
@@ -250,16 +263,15 @@ def play_sequence(path):
                     print("\nEMERGENCY STOP: releasing torque on all servos.")
                     disable_all_torque(packet_handler)
                     return
+                status = format_point_status(
+                    index, len(points), sequence["points"][index - 1], positions
+                )
+                print(status.replace("\n", "\r\n"), end="\r\n", flush=True)
                 move_all_sync(
                     packet_handler,
                     positions,
                     speed=settings.POSE_SEQUENCE_MOVE_SPEED,
                     acceleration=settings.POSE_SEQUENCE_MOVE_ACCELERATION,
-                )
-                print(
-                    f"\rMoving to point {index}/{len(points)} (Space = E-stop)",
-                    end="",
-                    flush=True,
                 )
                 if not wait_for_servos_or_estop(packet_handler, servo_ids, terminal):
                     return

@@ -3,7 +3,7 @@ I want to use github in my engineering project
 
 ENGG1101 五轴机械臂项目。代码源于
 [Kelvinchan324/STS3215-5DOF-Robot-Arm](https://github.com/Kelvinchan324/STS3215-5DOF-Robot-Arm)，
-包含六个 Python 操作脚本，以及手动摆位、按 q 记录五轴角度的新录制入口。
+包含六个 Python 操作脚本，以及手动摆位、输入 q 加回车记录五轴角度的录制入口。
 
 ## 项目结构与使用
 
@@ -23,8 +23,10 @@ python -m pip install -r requirements.txt
 python scripts/06_waypoint_recording.py
 ```
 
-运行 06 前支撑机械臂；Enter 后释放扭矩，输入名称，按 **q** 记录一个五轴角度点，
-至少两个点后按 **e** 保存。随后运行 05，选择 **2** 播放保存的动作。
+运行 06 前支撑机械臂；Enter 后释放扭矩，输入文件名。每次输入 **q + Enter** 记录一个五轴角度点，
+随后输入动作名称并回车；名称可留空，直接回车跳过。至少两个点后输入 **e + Enter** 保存。
+相同姿态可以重复录制，每次都是独立路点，但重复点不保证固定等待时长。
+随后运行 05，选择 **2** 播放；每步会显示动作名称（未命名则显示“步骤 N”）及五轴目标角度。
 
 ## 保持版本一致
 

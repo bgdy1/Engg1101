@@ -20,7 +20,6 @@ from arm_helpers import (
     positions_to_angles,
     read_all,
 )
-from terminal_keys import RawTerminal
 
 MOTION_FOLDER = PROJECT_FOLDER / "motions"
 NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$")
@@ -58,7 +57,7 @@ def save_sequence(path, sequence):
             prefix=f".{path.name}.", suffix=".tmp", delete=False,
         ) as temporary:
             temporary_path = Path(temporary.name)
-            json.dump(sequence, temporary, indent=2, allow_nan=False)
+            json.dump(sequence, temporary, indent=2, allow_nan=False, ensure_ascii=False)
             temporary.write("\n")
         if path.exists():
             raise FileExistsError(f"{path} already exists; refusing to overwrite it")
@@ -69,31 +68,33 @@ def save_sequence(path, sequence):
 
 
 def record_points(packet_handler, points):
-    """Collect whole poses with single keys; the terminal always restores on exit."""
-    print("Move and support the arm at each pose, then press q to record.")
-    print("Press e to save (at least two points). Ctrl+C ends recording.")
+    """Capture one pose per q + Enter, then accept an optional action name."""
+    print("Move and support the arm at each pose, then enter q to record.")
+    print("Enter e to save (at least two points). Press Enter after each command.")
+    print("Action names are optional. Ctrl+C ends recording.")
     print("Order: " + ", ".join(settings.JOINT_NAMES))
-    with RawTerminal() as terminal:
-        while True:
-            key = terminal.read_key(0.1)
-            if key == "\x03":
-                raise KeyboardInterrupt
-            if key == "e":
-                if len(points) >= 2:
-                    return
-                print("Record at least two waypoints before saving.", end="\r\n", flush=True)
-            elif key == "q":
-                try:
-                    point = read_angle_point(packet_handler)
-                except ValueError as error:
-                    print(f"Point rejected: {error}. Adjust the pose and press q again.", end="\r\n", flush=True)
-                    continue
-                points.append(point)
-                display = ", ".join(
-                    f"{name}: {float(value):.2f} deg"
-                    for name, value in zip(settings.JOINT_NAMES, point["input_values"])
-                )
-                print(f"Point {len(points)} recorded: {display}", end="\r\n", flush=True)
+    while True:
+        command = input("Command (q = record, e = save): ").strip().lower()
+        if command == "e":
+            if len(points) >= 2:
+                return
+            print("Record at least two waypoints before saving.")
+        elif command == "q":
+            try:
+                point = read_angle_point(packet_handler)
+            except ValueError as error:
+                print(f"Point rejected: {error}. Adjust the pose and enter q again.")
+                continue
+            point["action_name"] = input("Action name (optional; Enter to skip): ").strip()
+            points.append(point)
+            action_name = point["action_name"] or f"步骤 {len(points)}"
+            display = ", ".join(
+                f"{name}: {float(value):.2f} deg"
+                for name, value in zip(settings.JOINT_NAMES, point["input_values"])
+            )
+            print(f"Point {len(points)} recorded ({action_name}): {display}")
+        else:
+            print("Please enter q to record or e to save, then press Enter.")
 
 
 def record_sequence():
@@ -121,7 +122,7 @@ def record_sequence():
         recording_error = None
         try:
             record_points(packet_handler, sequence["points"])
-        except KeyboardInterrupt:
+        except (EOFError, KeyboardInterrupt):
             print("\nRecording interrupted; preserving complete waypoints.")
         except Exception as error:
             recording_error = error
