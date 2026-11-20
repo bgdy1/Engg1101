@@ -14,7 +14,7 @@
 
 - 工作区目录为 `D:\Projects\ENGG1101`；当前源码位于其子目录 `STS3215-5DOF-Robot-Arm-main/`。下文路径除特别说明均相对于该源码目录。
 - 原始上游：https://github.com/Kelvinchan324/STS3215-5DOF-Robot-Arm 。当前项目仓库为 https://github.com/bgdy1/Engg1101 ，Git 根目录是 `D:\Projects\ENGG1101`，远端 `origin` 指向 `https://github.com/bgdy1/Engg1101.git`，分支为 `main`，基于远端原有历史建立。不要在源码子目录另建仓库。
-- 功能：读取五舵机位置、原始刻度控制、角度控制、手动拖动示教录制/按时间回放、人工输入关节路点/逐点回放、q 加回车记录实物五轴角度路点并可选命名。
+- 功能：读取五舵机位置、原始刻度控制、角度控制、手动拖动示教录制/按时间回放、人工输入关节路点/逐点回放、手动摆位配合夹爪抓取或释放并保存角度路点。
 - 硬件链路：树莓派 Python → USB 串口 → Waveshare ESP32 控制板（需配置转发模式）→ STS3215 舵机总线；舵机由外部电源供电。
 - 仅包含上位机 Python 代码和随附舵机 SDK，不包含 ESP32 固件、CAD/STL、URDF、连杆尺寸、机械装配或负载验证。
 - “五自由度”在本代码中是底座、肩、肘、腕、夹爪五个控制通道；夹爪是开合通道，不能据此声称能独立控制末端六维位姿。
@@ -44,7 +44,7 @@ ENGG1101/
     │   ├── 03_move_joint_angle.py     输入五个角度，转换后单次同步运动
     │   ├── 04_timestamp_motion.py     拖动示教录制与按时间回放
     │   ├── 05_waypoint_sequence.py    人工录入路点与等待完成的逐点回放
-    │   └── 06_waypoint_recording.py   释放扭矩，q+Enter 记录并可选命名，e+Enter 保存供 05 播放
+    │   └── 06_waypoint_recording.py   手动摆位，q/w 驱动夹爪并记录，e 确认后保存供 05 播放
     ├── motions/
     │   ├── .gitkeep                   保留动作目录的占位文件
     │   ├── 1.json                    10 点角度路点，内部名称 1
@@ -87,6 +87,7 @@ ENGG1101/
 - 单次移动：`MOVE_SPEED=3000`、`MOVE_ACCELERATION=254`。
 - 路点回放：`POSE_SEQUENCE_MOVE_SPEED=3000`、`POSE_SEQUENCE_MOVE_ACCELERATION=254`。
 - 时间回放：`TIMESTAMP_MOVE_SPEED=800`、`TIMESTAMP_MOVE_ACCELERATION=50`。
+- 06 录制时的夹爪单轴移动：`GRIPPER_RECORD_MOVE_SPEED=800`、`GRIPPER_RECORD_MOVE_ACCELERATION=50`。
 - 录制采样目标间隔：`RECORD_INTERVAL_SECONDS=0.1`；脚本 04 自身定义保存间隔 2 秒。
 - 上述值是当前配置，不代表实物已完成标定。速度、加速度直接传入 SDK，勿把数值标为度/秒等未经确认的单位。
 
@@ -238,15 +239,15 @@ ENGG1101/
 
 **融合复用点**：保留“等待完成再推进”的策略；与 04 共用位置下发、文件目录和停止处理，但不要混淆调度机制或文件验证规则。
 
-### 5.6 06_waypoint_recording.py：回车记录实物角度路点与可选命名
+### 5.6 06_waypoint_recording.py：手动摆位与夹爪抓取/释放录制
 
-- **流程**：提示支撑机械臂并 Enter → `connect` → `disable_all_torque` → 输入未使用的文件名 → 普通 input 输入 q/e 并回车 → 保存并关闭串口。全程不使能扭矩、不发送运动目标、不自动播放、不切换 raw 模式；退出保持释放状态。
+- **流程**：支撑机械臂并 Enter → `connect` → `disable_all_torque` → 输入未使用的文件名 → 输入抓取角度和释放角度 → 普通 `input()` 接收 q/w/e 加回车。角度为有限度数，按 `angle_to_position` 检查夹爪限位和 raw 范围；无效时重填该项。前四轴保持扭矩关闭，供手动摆位。
 - **名称**：沿用 05 的正则和 `motions/` 目录；非法名称/重名会重试，不增加描述输入，description 为空。目录基于脚本位置解析，不依赖启动工作目录。
-- **q+Enter**：在回车时调用 `read_all → positions_to_angles`，再逐轴用 `angle_to_position` 校验当前限位；成功后输入动作名称并回车，名称可留空（直接 Enter）。确认名称输入后才追加点，显示序号/名称/五轴角度。命名中的 q/e 为普通文字；每次 q+Enter 都重新采样，重复姿态不去重、不合并，也不表示固定等待时长。超限/数值范围错误提示关节并拒绝该点，可调整后重试；通信异常终止本次录制。五轴顺序读取，并非同时采样。
-- **e+Enter**：至少两个点才保存退出；不足两个点提示并继续。指令忽略大小写及首尾空格，未知输入提示重试、不读取舵机。
-- **文件**：05 的 schema_version=1、type=pose_sequence、input_type=angles，包含 name、空 description、joint_order、created_at 和 points。每点保存 `input_values` 与 `action_name`；input_values 按 JOINT_NAMES 排列为角度数字字符串，保留转换精度，屏幕仅显示两位小数。action_name 是可留空的说明字符串，中文按 UTF-8 直接保存，方便手改标准 JSON。05 可发现并加载，回放按当时配置重新换算。
-- **保存/异常**：同目录唯一临时文件完成写入后 `os.replace`，保存前再次拒绝已有目标，失败清理临时文件并报错。Ctrl+C/EOF 或录制异常时尝试保存此前完整的至少两个点；未确认名称输入的点不追加，已空白回车确认的点算完整；不足两个点不写文件。通信异常在保存后仍报告失败；保存失败不打印成功。finally 关闭已取得的串口，06 无 raw 终端状态需要恢复。
-- **接口**：`choose_path`、`read_angle_point`、`save_sequence`、`record_points`、`record_sequence`、`main`；普通公共模块提供通信/转换，不动态加载 01/05。仅导入不连接硬件。运行：`python scripts/06_waypoint_recording.py`，要求树莓派/Linux 交互终端。
+- **q/w+Enter**：每次按配置顺序读取并校验前四轴，合格时 q 下发抓取目标，w 下发释放目标。限位错误可调整姿态后重试。首次有效指令先读取夹爪当前位置并将其设为初始目标，再仅使能夹爪，最后写入预设目标。各单轴写入均检查应答；成功后夹爪保持目标，操作者确认实际夹持或释放。随后输入可选动作名称并回车才追加点，重复点独立保存。
+- **e+Enter**：至少两个点才进入保存确认。夹爪已使能时提示托稳物体，输入 y/yes 后关闭夹爪扭矩并保存，其余输入继续录制。指令忽略大小写和首尾空格，未知指令提示重试。
+- **文件**：`pose_sequence` 的版本及字段沿用 05 契约；`input_values` 保存按 JOINT_NAMES 排列的五个角度字符串，前四个是实测角度，第五个是抓取或释放的预设角度。`action_name` 可留空，直接以 UTF-8 保存。05 按当前标定回放。
+- **保存/异常**：Ctrl+C、EOF 或录制故障会尝试关闭夹爪扭矩，并保存此前完整的至少两个点。夹爪应答失败或未确认名称的当前点不追加。无法确认夹爪扭矩关闭时明确报错。同目录临时文件写完再替换，拒绝覆盖已有文件，退出关闭串口。
+- **入口**：`python scripts/06_waypoint_recording.py`。`RecordingGripper` 负责录制期间的单舵机输出及清理；`read_angle_point` 负责手动关节采样，`record_points` 负责命令交互，`record_sequence` 负责串口和保存。
 
 ## 6. 动作文件契约与兼容性
 
@@ -313,7 +314,7 @@ ENGG1101/
 | 04 时间播放 | 原始样本+时间 | 使能 | 最后目标已发送 |
 | 05 创建 | 人工输入 | 无硬件连接 | 至少两点后保存 |
 | 05 路点播放 | 角度或 raw 路点 | 使能 | 最后点全部 Moving=0 |
-| 06 摆位录制 | q+Enter 读取五轴角度，再可选命名 | 关闭 | e+Enter 且至少两点后保存 |
+| 06 摆位录制 | q/w+Enter 读取前四轴并驱动夹爪，再可选命名 | 初始全部关闭；有效动作仅使能夹爪 | 至少两点，e+Enter 并确认关闭夹爪扭矩、保存 |
 
 融合建议（需按用户后续需求落地）：
 
@@ -347,15 +348,16 @@ python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
 ```
 
-- 当前现有测试共 47 个（arm_helpers 9 个、pose_sequence 16 个、waypoint_recording 22 个），使用 unittest、Fake handler、Mock 和 runpy；不驱动实物。测试依赖源码目录作为工作目录，改入口时注意该假设。
+- 当前现有测试共 52 个（arm_helpers 9 个、pose_sequence 16 个、waypoint_recording 27 个），使用 unittest、Fake handler、Mock 和 runpy；不驱动实物。测试依赖源码目录作为工作目录，改入口时注意该假设。
 - `test_arm_helpers.py`：01 的显示结果、02 数量/整数/范围、03 换算/限位/有限角度、同步目标与参数清理、扭矩开关写入。
 - `test_pose_sequence.py`：路点参数选择、raw/angle 解析、最简新格式、旧 raw 格式、内部名称与文件名不同、play 命令保存后返回路径、时间列表排除路点；新增动作名/五轴目标角度在移动前输出、缺名回退、名称类型校验、raw/旧格式显示角度、重复点逐点执行与停止不输出/执行下一步。
-- `test_waypoint_recording.py`：q/e 回车与最小点数、角度精度/夹爪反向及 05 加载、文件名重试/拒绝覆盖、中文/空动作名、q/e 作名字、重复姿态再次采样、超限、读取中断不追加半点、Ctrl+C/EOF 与命名中断保存、扭矩关闭失败、保存失败、串口关闭及无导入硬件/POSIX 终端副作用。
+- `test_waypoint_recording.py`：预设角度校验、q/w 采样及单夹爪命令顺序、反向换算及 05 加载、动作命名、重复路点、保存确认/取消、通信故障与中断清理、保存失败、串口关闭及无导入硬件副作用。
 - 当前测试没有全面覆盖 04 的采样/时间调度、异常清理、真实协议应答、运动到位或物理安全；通过这些测试也不能声称完成实物验证。
 - **2026-11-16 已观察**：当前 Windows Python 3.13.9 缺少 serial；unittest 在两个测试模块导入阶段报 `ModuleNotFoundError: serial`，不能报告 18 项测试已通过。
 - **同次静态检查**：18 个 Python 文件均可 AST 解析；5 份动作 JSON 均可读取，所有现有角度符合当时配置限位；Windows 的 termios 模块不存在。
 - **2026-11-16 新增 06 后验证**：Windows Python 3.13.9 仍缺少 serial/termios，且 WSL 未安装。测试进程内为缺失的 serial、termios、tty 注入替身后，以 `unittest.defaultTestLoader.discover('tests')` 运行全部 35 项，均通过；serial.Serial 替身禁止任何实物访问。此结果验证业务逻辑与模拟通信/按键，不代表原生 Windows 可运行或真实 POSIX 终端、串口已验证。另对 20 个 Python 文件执行 AST 解析、5 份现有动作执行 JSON 解析，均成功；未修改现有动作。
 - **2026-11-17 回车命名与播放提示验证**：Windows 环境仍缺少 serial/termios，测试进程内注入缺失的 serial、termios、tty 替身后运行 unittest discover，47 项均通过；serial.Serial 替身禁止实物访问。覆盖中文与留空命名、重复采样/播放、命名中断、目标角度显示、旧文件兼容及停止顺序；未连接硬件，未验证真实 POSIX 终端或 Windows 实物操作。
+- **2026-11-20 录制时控制夹爪验证**：Windows 上使用相同的进程内替身运行 unittest discover，52 项通过。夹爪写入顺序、失败应答、扭矩清理均为模拟验证。实物测试应先空载小幅验证方向、目标及退出扭矩状态。
 - 未连接硬件、未验证实物零位/方向/电源/承载/急停。后续应重新核实环境状态，不把上述记录当成永久现状。
 - 若实现融合，优先覆盖有意义的场景：读取/录制后移动需正确使能、停止不继续推进、两种调度不混淆、原有文件兼容、无导入硬件副作用、异常恢复终端并释放串口。用可控时钟/模拟串口，不靠真实 sleep 或实物来测试。
 
@@ -372,7 +374,7 @@ Git 同步约定：在工作区根目录管理整个项目；使用 `origin/main
 | 修改时间回放 | 04 的 load_motion、validate_positions、play_motion |
 | 修改路点输入或文件格式 | 05 的 create/parse/save/load、test_pose_sequence |
 | 修改路点播放 | 05 的 play_sequence、公共 wait/move、相关测试 |
-| 修改回车摆位录制/可选命名 | 06 的 read_angle_point/record_points/record_sequence/save_sequence、test_waypoint_recording；播放提示检查 05 的 load_sequence/format_point_status/play_sequence |
+| 修改回车摆位录制/可选命名 | 06 的 read_gripper_target/read_angle_point/RecordingGripper/record_points、test_waypoint_recording；回放兼容性检查 05 的 load_sequence |
 | 支持 Windows 或重做键盘输入 | terminal_keys.py、04 的 stdin select、各 raw 上下文调用点 |
 | 排查真实串口/协议问题 | arm_helpers.connect/check_result，再按需进入 port_handler/protocol_packet_handler/sms_sts |
 | 新统一入口 | 先按第 7 节明确交互与状态流，再只读需要提取的业务函数；无需重读整个 SDK |

@@ -3,6 +3,7 @@
 
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -15,14 +16,17 @@ sys.path.insert(0, str(PROJECT_FOLDER))
 import arm_settings as settings
 from arm_helpers import (
     angle_to_position,
+    check_result,
     connect,
     disable_all_torque,
-    positions_to_angles,
-    read_all,
+    position_to_angle,
+    read_servo,
 )
+from scservo_sdk import SMS_STS_TORQUE_ENABLE
 
 MOTION_FOLDER = PROJECT_FOLDER / "motions"
 NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$")
+GRIPPER = "gripper"
 
 
 def choose_path():
@@ -39,12 +43,67 @@ def choose_path():
         return path
 
 
-def read_angle_point(packet_handler):
-    """Read one complete pose and validate its angles against playback limits."""
-    angles = positions_to_angles(read_all(packet_handler))
+def read_gripper_target(action):
+    """Return a validated angle in degrees and its servo position."""
+    while True:
+        value = input(f"Gripper {action} angle (degrees): ").strip()
+        try:
+            angle = float(value)
+            if not math.isfinite(angle):
+                raise ValueError("Enter a finite number of degrees")
+            return angle, angle_to_position(GRIPPER, angle)
+        except ValueError as error:
+            print(f"Invalid {action} angle: {error}.")
+
+
+def read_angle_point(packet_handler, gripper_angle):
+    """Sample the free joints and add the selected gripper target angle."""
+    angles = {GRIPPER: gripper_angle}
     for name in settings.JOINT_NAMES:
-        angle_to_position(name, angles[name])
+        if name != GRIPPER:
+            position = read_servo(packet_handler, settings.SERVO_IDS[name])
+            angles[name] = position_to_angle(name, position)
+            angle_to_position(name, angles[name])
     return {"input_values": [str(angles[name]) for name in settings.JOINT_NAMES]}
+
+
+class RecordingGripper:
+    """Manage the one servo that can be powered during manual recording."""
+
+    def __init__(self, packet_handler):
+        self.packet_handler = packet_handler
+        self.servo_id = settings.SERVO_IDS[GRIPPER]
+        self.needs_release = False
+
+    def write_position(self, position):
+        result, error = self.packet_handler.WritePosEx(
+            self.servo_id, position,
+            settings.GRIPPER_RECORD_MOVE_SPEED, settings.GRIPPER_RECORD_MOVE_ACCELERATION,
+        )
+        check_result(self.packet_handler, result, error, "Set gripper target")
+
+    def set_torque(self, enabled):
+        result, error = self.packet_handler.write1ByteTxRx(
+            self.servo_id, SMS_STS_TORQUE_ENABLE, int(enabled)
+        )
+        action = "Enable" if enabled else "Disable"
+        check_result(self.packet_handler, result, error, f"{action} gripper torque")
+
+    def move_to(self, target):
+        if not self.needs_release:
+            present = read_servo(self.packet_handler, self.servo_id)
+            if not 0 <= present <= 4095:
+                raise RuntimeError("Gripper current position is outside 0–4095 ticks")
+            # Register cleanup before any write whose outcome could be uncertain.
+            self.needs_release = True
+            self.write_position(present)
+            self.set_torque(True)
+        self.write_position(target)
+
+    def release(self):
+        if self.needs_release:
+            self.set_torque(False)
+            self.needs_release = False
 
 
 def save_sequence(path, sequence):
@@ -67,24 +126,38 @@ def save_sequence(path, sequence):
             temporary_path.unlink()
 
 
-def record_points(packet_handler, points):
-    """Capture one pose per q + Enter, then accept an optional action name."""
-    print("Move and support the arm at each pose, then enter q to record.")
+def record_points(packet_handler, points, gripper, grasp, release):
+    """Capture one pose per grasp or release command, then accept its name."""
+    commands = {"q": ("Grasp", grasp), "w": ("Release", release)}
+    print("Support and hold the arm steady, then enter q to grasp or w to open the gripper.")
+    print(f"Grasp: {grasp[0]:g} deg. Release: {release[0]:g} deg.")
     print("Enter e to save (at least two points). Press Enter after each command.")
-    print("Action names are optional. Ctrl+C ends recording.")
+    print("Keep clear of the moving jaws and support the object before exiting.")
+    print("Ctrl+C, end of input, or a fault may release gripper torque.")
     print("Order: " + ", ".join(settings.JOINT_NAMES))
     while True:
-        command = input("Command (q = record, e = save): ").strip().lower()
+        command = input("Command (q = grasp, w = release, e = save): ").strip().lower()
         if command == "e":
-            if len(points) >= 2:
-                return
-            print("Record at least two waypoints before saving.")
-        elif command == "q":
-            try:
-                point = read_angle_point(packet_handler)
-            except ValueError as error:
-                print(f"Point rejected: {error}. Adjust the pose and enter q again.")
+            if len(points) < 2:
+                print("Record at least two waypoints before saving.")
                 continue
+            if gripper.needs_release:
+                confirmation = input(
+                    "Support any object, then disable gripper torque and save? [y/N]: "
+                ).strip().lower()
+                if confirmation not in ("y", "yes"):
+                    print("Save canceled. Continue recording.")
+                    continue
+            return
+        elif command in commands:
+            action, (angle, position) = commands[command]
+            try:
+                point = read_angle_point(packet_handler, angle)
+            except ValueError as error:
+                print(f"Point rejected: {error}. Adjust the pose and enter {command} again.")
+                continue
+            gripper.move_to(position)
+            print(f"{action} target accepted ({angle:g} deg). Check the gripper before moving the arm.")
             point["action_name"] = input("Action name (optional; Enter to skip): ").strip()
             points.append(point)
             action_name = point["action_name"] or f"步骤 {len(points)}"
@@ -94,7 +167,7 @@ def record_points(packet_handler, points):
             )
             print(f"Point {len(points)} recorded ({action_name}): {display}")
         else:
-            print("Please enter q to record or e to save, then press Enter.")
+            print("Please enter q to grasp, w to release, or e to save, then press Enter.")
 
 
 def record_sequence():
@@ -106,6 +179,9 @@ def record_sequence():
         disable_all_torque(packet_handler)
         print("Torque disabled on all configured servos; keep supporting the arm.")
         path = choose_path()
+        grasp = read_gripper_target("grasp")
+        release = read_gripper_target("release")
+        gripper = RecordingGripper(packet_handler)
         sequence = {
             "schema_version": 1,
             "type": "pose_sequence",
@@ -121,12 +197,21 @@ def record_sequence():
         }
         recording_error = None
         try:
-            record_points(packet_handler, sequence["points"])
+            record_points(packet_handler, sequence["points"], gripper, grasp, release)
         except (EOFError, KeyboardInterrupt):
             print("\nRecording interrupted; preserving complete waypoints.")
         except Exception as error:
             recording_error = error
             print(f"\nRecording failed: {error}. Preserving complete waypoints.", file=sys.stderr)
+        finally:
+            try:
+                gripper.release()
+            except (Exception, KeyboardInterrupt) as error:
+                detail = str(error) or type(error).__name__
+                message = f"Gripper torque off could not be confirmed: {detail}"
+                print(message, file=sys.stderr)
+                if recording_error is None:
+                    recording_error = RuntimeError(message)
 
         saved_path = None
         if len(sequence["points"]) >= 2:

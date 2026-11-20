@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import Mock, call, patch
 
 import arm_settings as settings
+from scservo_sdk import SMS_STS_TORQUE_ENABLE
 
 recording = runpy.run_path(
     "scripts/06_waypoint_recording.py", run_name="waypoint_recording_test"
@@ -25,7 +26,13 @@ class WaypointRecordingTests(unittest.TestCase):
         self.stack.enter_context(redirect_stdout(self.output))
         self.stack.enter_context(redirect_stderr(self.output))
         self.port = Mock()
-        self.handler = object()
+        self.handler = Mock()
+        self.gripper_id = 9
+        self.stack.enter_context(patch.dict(settings.SERVO_IDS, {"gripper": self.gripper_id}))
+        self.handler.WritePosEx.return_value = (0, 0)
+        self.handler.write1ByteTxRx.return_value = (0, 0)
+        self.handler.getTxRxResult.return_value = "serial failure"
+        self.handler.ReadPos.side_effect = self.read_position
         self.events = []
         self.disable = Mock(side_effect=lambda _handler: self.events.append("disable"))
         self.read = Mock()
@@ -33,15 +40,26 @@ class WaypointRecordingTests(unittest.TestCase):
             "MOTION_FOLDER": self.folder,
             "connect": Mock(return_value=(self.port, self.handler)),
             "disable_all_torque": self.disable,
-            "read_all": self.read,
         }))
         self.pose1 = dict(zip(settings.JOINT_NAMES, (2049, 2162, 1934, 2276, 1024)))
         self.pose2 = dict(zip(settings.JOINT_NAMES, (2051, 2050, 2047, 2052, 1707)))
 
-    def record(self, commands, poses=None, names=None, action_names=None):
+    def read_position(self, servo_id):
+        if servo_id == self.gripper_id:
+            return 2100, 0, 0
+        if servo_id == settings.SERVO_IDS["base_yaw"]:
+            self.current_pose = self.read()
+        name = next(name for name, configured_id in settings.SERVO_IDS.items()
+                    if configured_id == servo_id)
+        return self.current_pose[name], 0, 0
+
+    def record(self, commands, poses=None, names=None, action_names=None,
+               angles=("-40", "0"), confirmations=("yes",)):
         self.read.side_effect = poses if poses is not None else [self.pose1, self.pose2]
         answers = iter([""] + (names if names is not None else ["demo"]))
         commands = iter(commands)
+        angles = iter(angles)
+        confirmations = iter(confirmations)
         action_names = iter(action_names) if action_names is not None else None
 
         def answer(prompt):
@@ -50,6 +68,11 @@ class WaypointRecordingTests(unittest.TestCase):
                 value = next(commands)
             elif prompt.startswith("Action name"):
                 value = next(action_names) if action_names is not None else ""
+                self.events.append(("name", self.read.call_count, self.handler.WritePosEx.call_count))
+            elif prompt.startswith("Gripper"):
+                value = next(angles)
+            elif prompt.startswith("Support any object"):
+                value = next(confirmations)
             else:
                 value = next(answers)
             if isinstance(value, BaseException):
@@ -62,10 +85,13 @@ class WaypointRecordingTests(unittest.TestCase):
     def assert_closed(self):
         self.port.closePort.assert_called_once_with()
 
+    def grasped(self, pose):
+        return dict(pose, gripper=2503)
+
     def test_recorded_angles_round_trip_through_05_without_precision_loss(self):
-        path = self.record(["q", "q", "e"])
+        path = self.record(["q", "w", "e"])
         metadata, points = player["load_sequence"](path)
-        self.assertEqual(points, [self.pose1, self.pose2])
+        self.assertEqual(points, [self.grasped(self.pose1), dict(self.pose2, gripper=2048)])
         self.assertEqual(metadata["input_type"], "angles")
         self.assertEqual(metadata["schema_version"], 1)
         self.assertEqual(metadata["name"], "demo")
@@ -78,9 +104,18 @@ class WaypointRecordingTests(unittest.TestCase):
         values = metadata["points"][0]["input_values"]
         self.assertTrue(all(isinstance(value, str) for value in values))
         self.assertEqual(float(values[0]), 360 / 4096)
-        self.assertEqual(float(values[4]), 90.0)  # Reversed gripper direction.
+        self.assertEqual(float(values[4]), -40.0)
+        self.assertEqual(float(metadata["points"][1]["input_values"][4]), 0.0)
         self.assertEqual(self.events[:3], ["input", "disable", "input"])
-        self.assertEqual(self.read.call_args_list, [call(self.handler), call(self.handler)])
+        write = (settings.GRIPPER_RECORD_MOVE_SPEED, settings.GRIPPER_RECORD_MOVE_ACCELERATION)
+        axes = [call.ReadPos(settings.SERVO_IDS[name]) for name in settings.JOINT_NAMES[:4]]
+        self.assertEqual(self.handler.mock_calls, [
+            *axes, call.ReadPos(self.gripper_id), call.WritePosEx(self.gripper_id, 2100, *write),
+            call.write1ByteTxRx(self.gripper_id, SMS_STS_TORQUE_ENABLE, 1),
+            call.WritePosEx(self.gripper_id, 2503, *write),
+            *axes, call.WritePosEx(self.gripper_id, 2048, *write),
+            call.write1ByteTxRx(self.gripper_id, SMS_STS_TORQUE_ENABLE, 0),
+        ])
         self.assert_closed()
 
     def test_e_before_two_points_keeps_recording_and_other_commands_do_not_read(self):
@@ -100,11 +135,14 @@ class WaypointRecordingTests(unittest.TestCase):
         invalid = dict(self.pose1, shoulder=4095)
         path = self.record(["q", "q", "q", "e"], poses=[invalid, self.pose1, self.pose2])
         self.assertIn("shoulder", self.output.getvalue())
-        self.assertEqual(player["load_sequence"](path)[1], [self.pose1, self.pose2])
+        self.assertEqual(player["load_sequence"](path)[1], [self.grasped(self.pose1), self.grasped(self.pose2)])
+        self.assertEqual(self.handler.mock_calls[:2], [call.ReadPos(1), call.ReadPos(2)])
+        self.assertEqual(self.handler.WritePosEx.call_count, 3)
 
     def test_eof_saves_completed_points(self):
         path = self.record(["q", "q", EOFError()])
-        self.assertEqual(player["load_sequence"](path)[1], [self.pose1, self.pose2])
+        self.assertEqual(player["load_sequence"](path)[1], [self.grasped(self.pose1), self.grasped(self.pose2)])
+        self.handler.write1ByteTxRx.assert_called_with(self.gripper_id, SMS_STS_TORQUE_ENABLE, 0)
         self.assert_closed()
 
     def test_keyboard_interrupt_saves_completed_points(self):
@@ -124,7 +162,7 @@ class WaypointRecordingTests(unittest.TestCase):
                 self.pose1, self.pose2, RuntimeError("serial failure"),
             ])
         self.assertEqual(player["load_sequence"](self.folder / "demo.json")[1],
-                         [self.pose1, self.pose2])
+                         [self.grasped(self.pose1), self.grasped(self.pose2)])
         self.assert_closed()
 
     def test_incomplete_read_failure_does_not_save_a_partial_point(self):
@@ -134,15 +172,12 @@ class WaypointRecordingTests(unittest.TestCase):
         self.assert_closed()
 
     def test_partial_servo_read_failure_never_appends_a_point(self):
-        # Exercise the real sequential reader: three axes succeed, the fourth fails.
-        with patch("arm_helpers.read_servo", side_effect=[2048, 2048, 2048, RuntimeError("axis 4")]):
-            from arm_helpers import read_all
-            with patch.dict(recording["read_angle_point"].__globals__, {"read_all": read_all}):
-                points = []
-                with patch("builtins.input", return_value="q"):
-                    with self.assertRaisesRegex(RuntimeError, "axis 4"):
-                        recording["record_points"](self.handler, points)
-                self.assertEqual(points, [])
+        self.handler.ReadPos.side_effect = [(2048, 0, 0)] * 3 + [(0, -1, 0)]
+        with self.assertRaisesRegex(RuntimeError, "Read servo 4"):
+            self.record(["q"])
+        self.assertEqual(list(self.folder.iterdir()), [])
+        self.handler.WritePosEx.assert_not_called()
+        self.handler.write1ByteTxRx.assert_not_called()
 
     def test_torque_failure_prevents_naming_and_closes_port(self):
         self.disable.side_effect = RuntimeError("torque failure")
@@ -192,40 +227,75 @@ class WaypointRecordingTests(unittest.TestCase):
     def test_repeated_poses_are_sampled_again_and_kept_as_independent_points(self):
         path = self.record([" Q ", " q ", " E "], poses=[self.pose1, self.pose1])
         metadata, points = player["load_sequence"](path)
-        self.assertEqual(points, [self.pose1, self.pose1])
+        self.assertEqual(points, [self.grasped(self.pose1)] * 2)
         self.assertEqual(len(metadata["points"]), 2)
         self.assertEqual(self.read.call_count, 2)
 
-    def test_names_q_and_e_are_text_and_sampling_precedes_the_name_prompt(self):
-        answers = iter(["q", "q", "q", "e", "e"])
-        self.read.side_effect = [self.pose1, self.pose2]
-
-        def answer(prompt):
-            if prompt.startswith("Action name"):
-                self.assertEqual(self.read.call_count, len(points) + 1)
-            return next(answers)
-
-        points = []
-        with patch("builtins.input", side_effect=answer):
-            recording["record_points"](self.handler, points)
-        self.assertEqual([point["action_name"] for point in points], ["q", "e"])
-        self.assertEqual(self.read.call_count, 2)
+    def test_names_are_text_and_sampling_and_movement_precede_the_name_prompt(self):
+        path = self.record(["q", "w", "e"], action_names=["q", "w"])
+        metadata, _ = player["load_sequence"](path)
+        self.assertEqual([point["action_name"] for point in metadata["points"]], ["q", "w"])
+        self.assertEqual([event for event in self.events if isinstance(event, tuple)],
+                         [("name", 1, 2), ("name", 2, 3)])
 
     def test_interrupted_name_discards_only_the_unconfirmed_point(self):
         for interruption in (KeyboardInterrupt(), EOFError()):
             with self.subTest(interruption=type(interruption).__name__):
-                with patch("builtins.input", side_effect=["q", "", "q", interruption]):
-                    self.read.side_effect = [self.pose1, self.pose2]
-                    points = []
-                    with self.assertRaises(type(interruption)):
-                        recording["record_points"](self.handler, points)
-                self.assertEqual(len(points), 1)
-                self.assertEqual(points[0]["action_name"], "")
+                result = self.record(["q", "w"], action_names=["", interruption])
+                self.assertIsNone(result)
+                self.assertEqual(list(self.folder.iterdir()), [])
+                self.handler.write1ByteTxRx.assert_called_with(
+                    self.gripper_id, SMS_STS_TORQUE_ENABLE, 0
+                )
 
     def test_interrupt_during_naming_saves_previous_complete_points(self):
         path = self.record(["q", "q", "q"], poses=[self.pose1, self.pose2, self.pose1],
                            action_names=["first", "", KeyboardInterrupt()])
-        self.assertEqual(player["load_sequence"](path)[1], [self.pose1, self.pose2])
+        self.assertEqual(player["load_sequence"](path)[1], [self.grasped(self.pose1), self.grasped(self.pose2)])
+        self.assert_closed()
+
+    def test_invalid_angles_are_reprompted_and_decimal_target_is_saved(self):
+        path = self.record(["w", "q", "e"], angles=("", "no", "NaN", "-91", "-40.5", "inf", "0.5"))
+        output = self.output.getvalue()
+        self.assertEqual(output.count("Invalid grasp angle"), 4)
+        self.assertEqual(output.count("Invalid release angle"), 1)
+        metadata, _ = player["load_sequence"](path)
+        self.assertEqual([point["input_values"][4] for point in metadata["points"]], ["0.5", "-40.5"])
+
+    def test_canceling_exit_keeps_gripper_active_and_recording_continues(self):
+        path = self.record(["q", "w", "e", "q", "e"], poses=[self.pose1, self.pose2, self.pose1],
+                           confirmations=("", "Y"))
+        self.assertEqual(len(player["load_sequence"](path)[1]), 3)
+        self.assertIn("Save canceled", self.output.getvalue())
+        self.assertEqual(self.handler.write1ByteTxRx.call_args_list, [
+            call(self.gripper_id, SMS_STS_TORQUE_ENABLE, 1),
+            call(self.gripper_id, SMS_STS_TORQUE_ENABLE, 0),
+        ])
+
+    def test_target_write_failure_does_not_add_current_point_and_cleans_up(self):
+        self.handler.WritePosEx.side_effect = [(0, 0)] * 3 + [(-1, 0)]
+        with self.assertRaisesRegex(RuntimeError, "Set gripper target: serial failure"):
+            self.record(["q", "w", "q"], poses=[self.pose1, self.pose2, self.pose1])
+        _, points = player["load_sequence"](self.folder / "demo.json")
+        self.assertEqual(points, [self.grasped(self.pose1), dict(self.pose2, gripper=2048)])
+        self.handler.write1ByteTxRx.assert_called_with(self.gripper_id, SMS_STS_TORQUE_ENABLE, 0)
+        self.assert_closed()
+
+    def test_failed_enable_is_followed_by_torque_off_attempt(self):
+        self.handler.write1ByteTxRx.side_effect = [(-1, 0), (0, 0)]
+        with self.assertRaisesRegex(RuntimeError, "Enable gripper torque: serial failure"):
+            self.record(["q"])
+        self.assertEqual(list(self.folder.iterdir()), [])
+        self.assertEqual(self.handler.WritePosEx.call_count, 1)
+        self.handler.write1ByteTxRx.assert_called_with(self.gripper_id, SMS_STS_TORQUE_ENABLE, 0)
+        self.assert_closed()
+
+    def test_failed_torque_off_is_reported_and_complete_points_are_preserved(self):
+        self.handler.write1ByteTxRx.side_effect = [(0, 0), (-1, 0)]
+        with self.assertRaisesRegex(RuntimeError, "Gripper torque off could not be confirmed"):
+            self.record(["q", "w", "e"])
+        self.assertTrue((self.folder / "demo.json").exists())
+        self.assertIn("Gripper torque off could not be confirmed", self.output.getvalue())
         self.assert_closed()
 
     def test_save_refuses_a_file_created_during_recording(self):

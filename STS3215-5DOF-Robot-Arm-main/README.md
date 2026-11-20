@@ -64,7 +64,7 @@ Edit [arm_settings.py](arm_settings.py) to match your arm:
 | `SERVO_IDS` | Base **1**, shoulder **2**, elbow **3**, wrist **4**, gripper **5**. |
 | `ZERO_TICKS` | Raw position corresponding to 0° for each joint. Check the defaults of 2048 against your arm. |
 | `DIRECTIONS` and `ANGLE_LIMITS` | Each joint's positive rotation direction and allowed angle range. |
-| Speed and acceleration settings | Separate settings for single moves, timestamp playback and waypoint playback. |
+| Speed and acceleration settings | Separate settings for single moves, timestamp playback, waypoint playback and live gripper movement in 06. |
 
 **Support the arm before releasing torque.** Reading positions and recording
 timestamp motions or hand-positioned waypoints release torque, so the arm can fall under gravity. During
@@ -150,14 +150,16 @@ python scripts/06_waypoint_recording.py
 
 1. Support the arm and press Enter. The script connects and releases torque on all five servos.
 2. Enter a new filename without `.json`: 1-48 characters, starting with a letter or number, followed by letters, numbers, `_` or `-`. Invalid or existing names are requested again.
-3. Move the arm by hand, hold it steady, and type **q + Enter** to capture one complete five-joint pose. The angles are sampled when Enter is pressed. Poses outside the configured angle limits are rejected; adjust the pose and enter q again.
-4. Enter an action name and press Enter, or leave it blank and press Enter to skip naming. The point is then added and its name and five angles are displayed. During naming, q/e are ordinary text.
-5. Type **e + Enter** to save and exit. At least two points are required; otherwise recording continues. Commands accept either case and ignore surrounding whitespace.
+3. Enter a grasp angle, then a release angle, in degrees. The script validates finite values against the configured gripper limits. `-40` and `0` illustrate the input format. Use angles calibrated for your arm and object.
+4. Move the arm by hand and hold it steady. Type **q + Enter** to grasp or **w + Enter** to open to the release angle. The script reads and validates the first four joint angles before moving the gripper. The first four joints remain free to move by hand. The gripper holds its latest target between captures. Keep fingers clear of the jaws.
+5. After the gripper acknowledges the command, check the gripper and enter an action name, or press Enter to skip naming. The script then adds the point and displays its name and five angles. During naming, q/w/e are ordinary text.
+6. Type **e + Enter** after recording at least two points. Support any object and enter **y + Enter** to confirm turning off gripper torque and saving. Press Enter alone at the confirmation to continue recording. Commands accept either case and ignore surrounding whitespace.
 
 Files are saved to this repository's `motions/<name>.json`, regardless of the
 working directory. They use `type: "pose_sequence"` and `input_type: "angles"`;
-the saved values are calibrated joint angles in degrees, with full conversion
-precision, rather than raw ticks. To play them, run **05** and choose **2**.
+the saved values are in degrees. The first four values are measured angles
+with full conversion precision. The fifth is the selected gripper target.
+To play the file, run **05** and choose **2**.
 Playback uses the calibration currently in `arm_settings.py`.
 
 Each point also has an `action_name` field you can edit as its description:
@@ -169,18 +171,19 @@ Each point also has an `action_name` field you can edit as its description:
 This is standard JSON, so use the field rather than adding `//` comments.
 Chinese names are saved directly as UTF-8. Names are optional; missing, empty,
 or whitespace-only names display as “步骤 N” in 05. If present, the field must
-be a string. Existing files need no changes. Every q + Enter reads a new pose;
+be a string. Every q or w followed by Enter reads the first four joints again;
 identical poses are kept as separate waypoints and played in order. Repeating
 a waypoint does not create a fixed-duration dwell.
 
-Ctrl+C, EOF, or a communication failure ends recording and attempts to save
-previously completed points if there are at least two. A point is complete after
-its name input is confirmed, including a blank Enter. Interrupting that prompt
-discards the unconfirmed point. Failed reads never add partial points.
-Save failures are reported, and existing files are not overwritten. The serial
-port is closed on exit; torque remains released and
-the script does not play the recording. Keep supporting the arm throughout.
-Five joints are read sequentially, so hold each pose still when entering q.
+Ctrl+C, EOF, or a communication failure ends recording. The script attempts to
+turn off gripper torque and save previously completed points if there are at
+least two. Keep any object supported during an interruption. The script reports
+when it cannot confirm torque is off. A point is complete after the gripper
+acknowledges the command and you confirm the name prompt, including a blank
+Enter. Only complete points are saved. The serial port closes on exit.
+An acknowledgement confirms receipt of the target. Verify the actual grip or
+release before moving the arm. For the first hardware check, leave the jaws
+empty, choose a small range, and verify travel direction and torque release.
 06 uses ordinary line input and no longer imports the POSIX terminal module;
 05 and the other movement/playback scripts still require a POSIX terminal.
 Native Windows hardware operation has not been verified.
